@@ -63,6 +63,8 @@ import javax.ws.rs.HttpMethod;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.ext.ContextResolver;
+
+import java.io.File;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -74,7 +76,7 @@ public class SwaggerInflector extends ResourceConfig {
     private static final Logger LOGGER = LoggerFactory.getLogger(SwaggerInflector.class);
     private Configuration config;
     private String basePath;
-    private String originalBasePath;
+    private Map<Swagger, String> swaggerDefinitions;
     private ServletContext servletContext;
     private Map<String, List<String>> missingOperations = new HashMap<String, List<String>>();
     private Set<String> unimplementedMappedModels = new TreeSet<String>();
@@ -117,66 +119,154 @@ public class SwaggerInflector extends ResourceConfig {
 
     protected void init(Configuration configuration) {
         config = configuration;
-        SwaggerDeserializationResult swaggerParseResult = new SwaggerParser().readWithInfo(config.getSwaggerUrl(), null, true);
-        Swagger swagger = swaggerParseResult.getSwagger();
-
-        if(!config.getValidatePayloads().isEmpty()) {
-            LOGGER.info("resolving swagger");
-            new ResolverUtil().resolveFully(swagger);
+        List<String> swaggerFiles = new ArrayList<String>();
+        swaggerDefinitions = new HashMap<Swagger, String>();
+        File swaggerDir = new File(config.getSwaggerUrl());
+        if (swaggerDir.isDirectory()) {
+            for (File filesInDir : swaggerDir.listFiles()) {
+                if (filesInDir.getName().endsWith(".yaml")) {
+                    swaggerFiles.add(config.getSwaggerUrl() + (config.getSwaggerUrl().endsWith("/") ? "" : "/") + filesInDir.getName());
+                }
+            }
         }
+        else {
+            swaggerFiles.add(config.getSwaggerUrl());
+        }
+        
+        for (String swaggerUrl : swaggerFiles) {
+            SwaggerDeserializationResult swaggerParseResult = new SwaggerParser().readWithInfo(swaggerUrl, null, true);
+            Swagger swagger = swaggerParseResult.getSwagger();
 
-        if (swagger != null) {
-            originalBasePath = swagger.getBasePath();
-            StringBuilder b = new StringBuilder();
-
-            if (!"".equals(configuration.getRootPath()))
-                b.append(configuration.getRootPath());
-            if (swagger.getBasePath() != null) {
-                b.append(swagger.getBasePath());
+            if(!config.getValidatePayloads().isEmpty()) {
+                LOGGER.info("resolving swagger");
+                new ResolverUtil().resolveFully(swagger);
             }
-            if (b.length() > 0) {
-                swagger.setBasePath(b.toString());
+            
+            if (swagger != null && swaggerDefinitions.containsValue(swagger.getBasePath())) {
+                LOGGER.error("Swagger file '" + swaggerUrl + "' is skipped because it's base path is already in use!");
+                swagger = null;
             }
 
-            Map<String, Path> paths = swagger.getPaths();
-            Map<String, Model> definitions = swagger.getDefinitions();
-            for (String pathString : paths.keySet()) {
-                Path path = paths.get(pathString);
-                final Resource.Builder builder = Resource.builder();
-                this.basePath = configuration.getRootPath() + swagger.getBasePath();
+            if (swagger != null) {
+                swaggerDefinitions.put(swagger, swagger.getBasePath());
+                StringBuilder b = new StringBuilder();
+                
+                if (!"".equals(configuration.getRootPath()))
+                    b.append(configuration.getRootPath());
+                if (swagger.getBasePath() != null) {
+                    b.append(swagger.getBasePath());
+                }
+                if (b.length() > 0) {
+                    swagger.setBasePath(b.toString());
+                }
 
-                builder.path(basePath(originalBasePath, pathString));
-                Operation operation;
+                Map<String, Path> paths = swagger.getPaths();
+                Map<String, Model> definitions = swagger.getDefinitions();
+                for (String pathString : paths.keySet()) {
+                    Path path = paths.get(pathString);
+                    final Resource.Builder builder = Resource.builder();
+                    this.basePath = configuration.getRootPath() + swagger.getBasePath();
 
-                operation = path.getGet();
-                if (operation != null) {
-                    addOperation(pathString, builder, HttpMethod.GET, operation, definitions);
+                    builder.path(basePath(swaggerDefinitions.get(swagger), pathString));
+                    Operation operation;
+
+                    operation = path.getGet();
+                    if (operation != null) {
+                        addOperation(pathString, builder, HttpMethod.GET, operation, definitions);
+                    }
+                    operation = path.getPost();
+                    if (operation != null) {
+                        addOperation(pathString, builder, HttpMethod.POST, operation, definitions);
+                    }
+                    operation = path.getPut();
+                    if (operation != null) {
+                        addOperation(pathString, builder, HttpMethod.PUT, operation, definitions);
+                    }
+                    operation = path.getDelete();
+                    if (operation != null) {
+                        addOperation(pathString, builder, HttpMethod.DELETE, operation, definitions);
+                    }
+                    operation = path.getOptions();
+                    if (operation != null) {
+                        addOperation(pathString, builder, HttpMethod.OPTIONS, operation, definitions);
+                    }
+                    operation = path.getPatch();
+                    if (operation != null) {
+                        addOperation(pathString, builder, "PATCH", operation, definitions);
+                    }
+                    registerResources(builder.build());
                 }
-                operation = path.getPost();
-                if (operation != null) {
-                    addOperation(pathString, builder, HttpMethod.POST, operation, definitions);
+
+                InflectResult result = new InflectResult();
+                for(String key: swaggerParseResult.getMessages()) {
+                    result.specParseMessage(key);
                 }
-                operation = path.getPut();
-                if (operation != null) {
-                    addOperation(pathString, builder, HttpMethod.PUT, operation, definitions);
+                for(String key: missingOperations.keySet()) {
+                    result.unimplementedControllers(key, missingOperations.get(key));
                 }
-                operation = path.getDelete();
-                if (operation != null) {
-                    addOperation(pathString, builder, HttpMethod.DELETE, operation, definitions);
+                for(String model: config.getUnimplementedModels()) {
+                    result.unimplementedModel(model);
                 }
-                operation = path.getOptions();
-                if (operation != null) {
-                    addOperation(pathString, builder, HttpMethod.OPTIONS, operation, definitions);
+                for(String model: unimplementedMappedModels) {
+                    result.unimplementedModel(model);
                 }
-                operation = path.getPatch();
-                if (operation != null) {
-                    addOperation(pathString, builder, "PATCH", operation, definitions);
+
+                if (Configuration.Environment.DEVELOPMENT.equals(configuration.getEnvironment())) {
+                    if(missingOperations.size() > 0) {
+                        LOGGER.debug("There are unimplemented operations!");
+                    }
+                    for(String key: missingOperations.keySet()) {
+                        LOGGER.debug(key);
+                        for(String val: missingOperations.get(key)) {
+                            LOGGER.debug(" - " + val);
+                        }
+                    }
+                    final Resource.Builder builder = Resource.builder();
+                    builder.path(basePath(swaggerDefinitions.get(swagger), config.getSwaggerBase() + "debug.json"))
+                            .addMethod(HttpMethod.GET)
+                            .produces(MediaType.APPLICATION_JSON)
+                            .handledBy(new InflectResultController(result))
+                            .build();
+
+                    registerResources(builder.build());
                 }
-                registerResources(builder.build());
+                else if (Configuration.Environment.STAGING.equals(configuration.getEnvironment())) {
+                    if(missingOperations.size() > 0) {
+                        LOGGER.warn("There are unimplemented operations!");
+                    }
+                    for(String key: missingOperations.keySet()) {
+                        LOGGER.warn(key);
+                        for(String val: missingOperations.get(key)) {
+                            LOGGER.warn(" - " + val);
+                        }
+                    }
+                }
+                else if (Configuration.Environment.PRODUCTION.equals(configuration.getEnvironment())) {
+                    if(missingOperations.size() > 0) {
+                        LOGGER.error("There are unimplemented operations!");
+                    }
+                    for(String key: missingOperations.keySet()) {
+                        LOGGER.error(key);
+                        for(String val: missingOperations.get(key)) {
+                            LOGGER.error(" - " + val);
+                        }
+                    }
+                    if(missingOperations.size() > 0) {
+                        LOGGER.error("Unable to start due to unimplemented methods");
+                        throw new RuntimeException("Unable to start due to unimplemented methods");
+                    }
+                }
+                
+                missingOperations.clear();
+            } else {
+                LOGGER.error("the swagger definition is not valid");
             }
-        } else {
+        }
+        
+        if (swaggerDefinitions.isEmpty()) {
             LOGGER.error("No swagger definition detected!  Not much to do...");
         }
+        
         SimpleModule simpleModule = new SimpleModule();
         simpleModule.addSerializer(new JsonNodeExampleSerializer());
 
@@ -193,10 +283,6 @@ public class SwaggerInflector extends ResourceConfig {
         }
         else {
             FilterFactory.setFilter(new DefaultSpecFilter());
-        }
-
-        if(swagger == null) {
-            LOGGER.error("the swagger definition is not valid");
         }
 
         // Add content providers in order or appearance in the configuration
@@ -218,7 +304,9 @@ public class SwaggerInflector extends ResourceConfig {
                             ContextResolver.class);
                 }
                 enableProcessor(JacksonProcessor.class, MediaType.APPLICATION_JSON_TYPE);
-                enableSwaggerJSON(swagger, configuration.getSwaggerProcessors());
+                for (Swagger swagger : swaggerDefinitions.keySet()) {
+                    enableSwaggerJSON(swagger, configuration.getSwaggerProcessors());
+                }
             } else if ("xml".equalsIgnoreCase(item)) {
                 // XML
                 if (!isRegistered(DefaultContentTypeProvider.class)) {
@@ -233,7 +321,9 @@ public class SwaggerInflector extends ResourceConfig {
                 Yaml.mapper().registerModule(simpleModule);
                 register(YamlExampleProvider.class);
                 enableProcessor(JacksonProcessor.class, JacksonProcessor.APPLICATION_YAML_TYPE);
-                enableSwaggerYAML(swagger, configuration.getSwaggerProcessors());
+                for (Swagger swagger : swaggerDefinitions.keySet()) {
+                    enableSwaggerYAML(swagger, configuration.getSwaggerProcessors());
+                }
             }
         }
 
@@ -290,66 +380,6 @@ public class SwaggerInflector extends ResourceConfig {
         } else {
             InputConverter.getInstance().defaultConverters();
         }
-
-        InflectResult result = new InflectResult();
-        for(String key: swaggerParseResult.getMessages()) {
-            result.specParseMessage(key);
-        }
-        for(String key: missingOperations.keySet()) {
-            result.unimplementedControllers(key, missingOperations.get(key));
-        }
-        for(String model: config.getUnimplementedModels()) {
-            result.unimplementedModel(model);
-        }
-        for(String model: unimplementedMappedModels) {
-            result.unimplementedModel(model);
-        }
-
-        if (Configuration.Environment.DEVELOPMENT.equals(configuration.getEnvironment())) {
-            if(missingOperations.size() > 0) {
-                LOGGER.debug("There are unimplemented operations!");
-            }
-            for(String key: missingOperations.keySet()) {
-                LOGGER.debug(key);
-                for(String val: missingOperations.get(key)) {
-                    LOGGER.debug(" - " + val);
-                }
-            }
-            final Resource.Builder builder = Resource.builder();
-            builder.path(basePath(originalBasePath, config.getSwaggerBase() + "debug.json"))
-                    .addMethod(HttpMethod.GET)
-                    .produces(MediaType.APPLICATION_JSON)
-                    .handledBy(new InflectResultController(result))
-                    .build();
-
-            registerResources(builder.build());
-        }
-        else if (Configuration.Environment.STAGING.equals(configuration.getEnvironment())) {
-            if(missingOperations.size() > 0) {
-                LOGGER.warn("There are unimplemented operations!");
-            }
-            for(String key: missingOperations.keySet()) {
-                LOGGER.warn(key);
-                for(String val: missingOperations.get(key)) {
-                    LOGGER.warn(" - " + val);
-                }
-            }
-        }
-        else if (Configuration.Environment.PRODUCTION.equals(configuration.getEnvironment())) {
-            if(missingOperations.size() > 0) {
-                LOGGER.error("There are unimplemented operations!");
-            }
-            for(String key: missingOperations.keySet()) {
-                LOGGER.error(key);
-                for(String val: missingOperations.get(key)) {
-                    LOGGER.error(" - " + val);
-                }
-            }
-            if(missingOperations.size() > 0) {
-                LOGGER.error("Unable to start due to unimplemented methods");
-                throw new RuntimeException("Unable to start due to unimplemented methods");
-            }
-        }
     }
 
     public static String basePath(String basePath, String path) {
@@ -399,7 +429,7 @@ public class SwaggerInflector extends ResourceConfig {
 
     private void enableSwaggerJSON(Swagger swagger, List<String> swaggerProcessors) {
         final Resource.Builder builder = Resource.builder();
-        builder.path(basePath(originalBasePath, StringUtils.appendIfMissing(config.getSwaggerBase(), "/") + "swagger.json"))
+        builder.path(basePath(swaggerDefinitions.get(swagger), StringUtils.appendIfMissing(config.getSwaggerBase(), "/") + "swagger.json"))
                 .addMethod(HttpMethod.GET)
                 .produces(MediaType.APPLICATION_JSON)
                 .handledBy(new SwaggerResourceController(swagger, swaggerProcessors))
@@ -410,7 +440,7 @@ public class SwaggerInflector extends ResourceConfig {
 
     private void enableSwaggerYAML(Swagger swagger, List<String> swaggerProcessors) {
         final Resource.Builder builder = Resource.builder();
-        builder.path(basePath(originalBasePath, StringUtils.appendIfMissing(config.getSwaggerBase(), "/") + "swagger.yaml"))
+        builder.path(basePath(swaggerDefinitions.get(swagger), StringUtils.appendIfMissing(config.getSwaggerBase(), "/") + "swagger.yaml"))
                 .addMethod(HttpMethod.GET)
                 .produces("application/yaml")
                 .handledBy(new SwaggerResourceController(swagger, swaggerProcessors))
