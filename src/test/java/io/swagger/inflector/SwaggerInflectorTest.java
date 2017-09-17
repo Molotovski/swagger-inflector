@@ -26,7 +26,7 @@ import org.testng.annotations.BeforeTest;
 import org.testng.annotations.Test;
 
 
-;import static org.testng.Assert.*;
+import static org.testng.Assert.*;
 
 
 public class SwaggerInflectorTest {
